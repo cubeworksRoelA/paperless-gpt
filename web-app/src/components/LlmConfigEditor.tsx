@@ -17,6 +17,7 @@ interface LlmConfig {
   llm_model: string;
   vision_llm_provider: string;
   vision_llm_model: string;
+  ollama_host: string;
 }
 
 const PROVIDERS = ['ollama', 'openai', 'anthropic', 'mistral', 'googleai'];
@@ -30,6 +31,8 @@ const LlmConfigEditor: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [ollamaStatus, setOllamaStatus] = useState<'connected' | 'error' | 'checking'>('checking');
+  const [ollamaError, setOllamaError] = useState<string | null>(null);
 
   const fetchConfig = useCallback(async () => {
     setIsLoading(true);
@@ -47,13 +50,24 @@ const LlmConfigEditor: React.FC = () => {
   }, []);
 
   const fetchOllamaModels = useCallback(async () => {
+    setOllamaStatus('checking');
+    setOllamaError(null);
     try {
       const res = await fetch('./api/ollama-models');
-      if (!res.ok) return;
+      if (!res.ok) {
+        const errData = await res.json();
+        setOllamaStatus('error');
+        setOllamaError(errData.error || 'Failed to connect');
+        setOllamaModels([]);
+        return;
+      }
       const data = await res.json();
       setOllamaModels(data.models || []);
+      setOllamaStatus('connected');
     } catch {
-      // Ollama might not be reachable, that's ok
+      setOllamaStatus('error');
+      setOllamaError('Failed to reach Ollama');
+      setOllamaModels([]);
     }
   }, []);
 
@@ -85,13 +99,15 @@ const LlmConfigEditor: React.FC = () => {
       setInitialConfig(config);
       setSuccessMessage('LLM configuration saved successfully!');
       setTimeout(() => setSuccessMessage(null), 3000);
+      // Refresh models after saving (host may have changed)
+      fetchOllamaModels();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unknown error occurred');
       setTimeout(() => setError(null), 5000);
     } finally {
       setIsSaving(false);
     }
-  }, [config, isDirty]);
+  }, [config, isDirty, fetchOllamaModels]);
 
   const handleChange = (key: keyof LlmConfig, value: string) => {
     setConfig((prev) => (prev ? { ...prev, [key]: value } : null));
@@ -107,6 +123,7 @@ const LlmConfigEditor: React.FC = () => {
 
   const isOllamaLlm = config.llm_provider === 'ollama';
   const isOllamaVision = config.vision_llm_provider === 'ollama';
+  const showOllamaHost = isOllamaLlm || isOllamaVision;
 
   return (
     <div className="p-6 bg-gray-100 dark:bg-gray-900">
@@ -129,6 +146,62 @@ const LlmConfigEditor: React.FC = () => {
       {successMessage && (
         <div className="fixed bottom-4 right-4 bg-green-500 text-white px-6 py-3 rounded-lg shadow-lg transition-transform transform animate-bounce" role="alert">
           <span>{successMessage}</span>
+        </div>
+      )}
+
+      {/* Ollama Host */}
+      {showOllamaHost && (
+        <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-4 mb-6">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-xl font-semibold text-gray-700 dark:text-gray-300">Ollama Connection</h2>
+            <div className="flex items-center gap-2">
+              {ollamaStatus === 'checking' && (
+                <span className="flex items-center text-xs text-gray-400">
+                  <span className="w-2 h-2 rounded-full bg-gray-400 animate-pulse mr-1" />
+                  Checking...
+                </span>
+              )}
+              {ollamaStatus === 'connected' && (
+                <span className="flex items-center text-xs text-green-600 dark:text-green-400">
+                  <span className="w-2 h-2 rounded-full bg-green-500 mr-1" />
+                  Connected ({ollamaModels.length} model{ollamaModels.length !== 1 ? 's' : ''})
+                </span>
+              )}
+              {ollamaStatus === 'error' && (
+                <span className="flex items-center text-xs text-red-600 dark:text-red-400">
+                  <span className="w-2 h-2 rounded-full bg-red-500 mr-1" />
+                  Unreachable
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={config.ollama_host}
+              onChange={(e) => handleChange('ollama_host', e.target.value)}
+              className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 font-mono text-sm"
+              placeholder="http://127.0.0.1:11434"
+            />
+            <button
+              onClick={() => {
+                // Save first to update the host, then test connection
+                if (isDirty) {
+                  handleSave();
+                } else {
+                  fetchOllamaModels();
+                }
+              }}
+              className="px-4 py-2 bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-200 rounded-md text-sm font-medium transition"
+            >
+              Test
+            </button>
+          </div>
+          {ollamaStatus === 'error' && ollamaError && (
+            <div className="mt-2 text-xs text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/30 rounded p-2">
+              {ollamaError}
+            </div>
+          )}
         </div>
       )}
 
@@ -215,12 +288,6 @@ const LlmConfigEditor: React.FC = () => {
           </div>
         </div>
       </div>
-
-      {ollamaModels.length > 0 && (
-        <div className="mt-4 text-sm text-gray-500 dark:text-gray-400">
-          {ollamaModels.length} model{ollamaModels.length !== 1 ? 's' : ''} available on Ollama
-        </div>
-      )}
 
       <div className="flex justify-end mt-6">
         <button

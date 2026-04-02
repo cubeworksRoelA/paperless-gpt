@@ -741,11 +741,16 @@ func (app *App) getLlmConfigHandler(c *gin.Context) {
 	settingsMutex.RLock()
 	defer settingsMutex.RUnlock()
 
+	ollamaHost := os.Getenv("OLLAMA_HOST")
+	if ollamaHost == "" {
+		ollamaHost = "http://127.0.0.1:11434"
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"llm_provider":       llmProvider,
 		"llm_model":          llmModel,
 		"vision_llm_provider": visionLlmProvider,
 		"vision_llm_model":    visionLlmModel,
+		"ollama_host":         ollamaHost,
 	})
 }
 
@@ -756,6 +761,7 @@ func (app *App) updateLlmConfigHandler(c *gin.Context) {
 		LlmModel          string `json:"llm_model"`
 		VisionLlmProvider string `json:"vision_llm_provider"`
 		VisionLlmModel    string `json:"vision_llm_model"`
+		OllamaHost        string `json:"ollama_host"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload"})
@@ -774,6 +780,9 @@ func (app *App) updateLlmConfigHandler(c *gin.Context) {
 	}
 	if req.VisionLlmModel != "" {
 		visionLlmModel = req.VisionLlmModel
+	}
+	if req.OllamaHost != "" {
+		os.Setenv("OLLAMA_HOST", req.OllamaHost)
 	}
 
 	// Recreate LLM clients
@@ -799,6 +808,7 @@ func (app *App) updateLlmConfigHandler(c *gin.Context) {
 	settings.LlmModel = llmModel
 	settings.VisionLlmProvider = visionLlmProvider
 	settings.VisionLlmModel = visionLlmModel
+	settings.OllamaHost = os.Getenv("OLLAMA_HOST")
 	if err := saveSettingsLocked(); err != nil {
 		log.Errorf("Failed to save LLM config to settings: %v", err)
 	}

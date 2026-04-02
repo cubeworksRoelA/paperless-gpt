@@ -174,6 +174,10 @@ func main() {
 		visionLlmModel = settings.VisionLlmModel
 		log.Infof("Using saved Vision LLM model from settings: %s", visionLlmModel)
 	}
+	if settings.OllamaHost != "" {
+		os.Setenv("OLLAMA_HOST", settings.OllamaHost)
+		log.Infof("Using saved Ollama host from settings: %s", settings.OllamaHost)
+	}
 
 	// Print version
 	printVersion()
