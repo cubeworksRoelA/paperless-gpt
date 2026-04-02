@@ -745,23 +745,29 @@ func (app *App) getLlmConfigHandler(c *gin.Context) {
 	if ollamaHost == "" {
 		ollamaHost = "http://127.0.0.1:11434"
 	}
+	var ollamaCtxLen int
+	if v := os.Getenv("OLLAMA_CONTEXT_LENGTH"); v != "" {
+		ollamaCtxLen, _ = strconv.Atoi(v)
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"llm_provider":       llmProvider,
-		"llm_model":          llmModel,
-		"vision_llm_provider": visionLlmProvider,
-		"vision_llm_model":    visionLlmModel,
-		"ollama_host":         ollamaHost,
+		"llm_provider":          llmProvider,
+		"llm_model":             llmModel,
+		"vision_llm_provider":   visionLlmProvider,
+		"vision_llm_model":      visionLlmModel,
+		"ollama_host":           ollamaHost,
+		"ollama_context_length": ollamaCtxLen,
 	})
 }
 
 // updateLlmConfigHandler handles the POST /api/llm-config endpoint
 func (app *App) updateLlmConfigHandler(c *gin.Context) {
 	var req struct {
-		LlmProvider       string `json:"llm_provider"`
-		LlmModel          string `json:"llm_model"`
-		VisionLlmProvider string `json:"vision_llm_provider"`
-		VisionLlmModel    string `json:"vision_llm_model"`
-		OllamaHost        string `json:"ollama_host"`
+		LlmProvider         string `json:"llm_provider"`
+		LlmModel            string `json:"llm_model"`
+		VisionLlmProvider   string `json:"vision_llm_provider"`
+		VisionLlmModel      string `json:"vision_llm_model"`
+		OllamaHost          string `json:"ollama_host"`
+		OllamaContextLength int    `json:"ollama_context_length"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload"})
@@ -784,6 +790,11 @@ func (app *App) updateLlmConfigHandler(c *gin.Context) {
 	if req.OllamaHost != "" {
 		os.Setenv("OLLAMA_HOST", req.OllamaHost)
 	}
+	if req.OllamaContextLength > 0 {
+		os.Setenv("OLLAMA_CONTEXT_LENGTH", strconv.Itoa(req.OllamaContextLength))
+	} else {
+		os.Unsetenv("OLLAMA_CONTEXT_LENGTH")
+	}
 
 	// Recreate LLM clients
 	newLLM, err := createLLM()
@@ -802,6 +813,11 @@ func (app *App) updateLlmConfigHandler(c *gin.Context) {
 	app.VisionLLM = newVisionLLM
 	app.llmMu.Unlock()
 
+	// Recreate OCR provider with new settings
+	if err := app.recreateOCRProvider(); err != nil {
+		log.Errorf("Failed to recreate OCR provider: %v", err)
+	}
+
 	// Persist to settings
 	settingsMutex.Lock()
 	settings.LlmProvider = llmProvider
@@ -809,6 +825,7 @@ func (app *App) updateLlmConfigHandler(c *gin.Context) {
 	settings.VisionLlmProvider = visionLlmProvider
 	settings.VisionLlmModel = visionLlmModel
 	settings.OllamaHost = os.Getenv("OLLAMA_HOST")
+	settings.OllamaContextLength = req.OllamaContextLength
 	if err := saveSettingsLocked(); err != nil {
 		log.Errorf("Failed to save LLM config to settings: %v", err)
 	}

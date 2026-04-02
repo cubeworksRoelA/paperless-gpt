@@ -18,6 +18,7 @@ interface LlmConfig {
   vision_llm_provider: string;
   vision_llm_model: string;
   ollama_host: string;
+  ollama_context_length: number;
 }
 
 const PROVIDERS = ['ollama', 'openai', 'anthropic', 'mistral', 'googleai'];
@@ -109,7 +110,7 @@ const LlmConfigEditor: React.FC = () => {
     }
   }, [config, isDirty, fetchOllamaModels]);
 
-  const handleChange = (key: keyof LlmConfig, value: string) => {
+  const handleChange = (key: keyof LlmConfig, value: string | number) => {
     setConfig((prev) => (prev ? { ...prev, [key]: value } : null));
   };
 
@@ -202,6 +203,20 @@ const LlmConfigEditor: React.FC = () => {
               {ollamaError}
             </div>
           )}
+          <div className="mt-3">
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Context Length <span className="text-gray-400 font-normal">(0 = default)</span>
+            </label>
+            <input
+              type="number"
+              value={config.ollama_context_length || ''}
+              onChange={(e) => handleChange('ollama_context_length', parseInt(e.target.value) || 0)}
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 font-mono text-sm"
+              placeholder="Default (model-specific)"
+              min={0}
+            />
+            <p className="text-xs text-gray-400 mt-1">Lower values use less memory. Try 2048 for constrained hardware, 0 for unlimited.</p>
+          </div>
         </div>
       )}
 

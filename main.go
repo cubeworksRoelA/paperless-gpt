@@ -178,6 +178,10 @@ func main() {
 		os.Setenv("OLLAMA_HOST", settings.OllamaHost)
 		log.Infof("Using saved Ollama host from settings: %s", settings.OllamaHost)
 	}
+	if settings.OllamaContextLength > 0 {
+		os.Setenv("OLLAMA_CONTEXT_LENGTH", strconv.Itoa(settings.OllamaContextLength))
+		log.Infof("Using saved Ollama context length from settings: %d", settings.OllamaContextLength)
+	}
 
 	// Print version
 	printVersion()
@@ -962,6 +966,54 @@ func getRateLimitConfig(isVision bool) RateLimitConfig {
 }
 
 // createLLM creates the appropriate LLM client based on the provider
+// recreateOCRProvider rebuilds the OCR provider using current env/settings
+func (app *App) recreateOCRProvider() error {
+	providerType := os.Getenv("OCR_PROVIDER")
+	if providerType == "" {
+		providerType = "llm"
+	}
+	if providerType == "llm" && visionLlmProvider == "" {
+		log.Warn("No VISION_LLM_PROVIDER set, disabling OCR provider")
+		app.ocrProvider = nil
+		return nil
+	}
+
+	var promptBuffer bytes.Buffer
+	templateMutex.RLock()
+	err := ocrTemplate.Execute(&promptBuffer, map[string]interface{}{
+		"Language": getLikelyLanguage(),
+	})
+	templateMutex.RUnlock()
+	if err != nil {
+		return fmt.Errorf("error executing OCR template: %w", err)
+	}
+
+	var ollamaContextLength int
+	if ctxLenStr := os.Getenv("OLLAMA_CONTEXT_LENGTH"); ctxLenStr != "" {
+		if parsed, err := strconv.Atoi(ctxLenStr); err == nil {
+			ollamaContextLength = parsed
+		}
+	}
+
+	ocrConfig := ocr.Config{
+		Provider:          providerType,
+		VisionLLMProvider: visionLlmProvider,
+		VisionLLMModel:    visionLlmModel,
+		VisionLLMPrompt:   promptBuffer.String(),
+		EnableHOCR:        true,
+		OllamaContextLength: ollamaContextLength,
+	}
+
+	provider, err := ocr.NewProvider(ocrConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create OCR provider: %w", err)
+	}
+	app.ocrProvider = provider
+	log.Infof("OCR provider recreated: type=%s vision_provider=%s model=%s host=%s",
+		providerType, visionLlmProvider, visionLlmModel, os.Getenv("OLLAMA_HOST"))
+	return nil
+}
+
 func createLLM() (llms.Model, error) {
 	switch strings.ToLower(llmProvider) {
 	case "mistral":

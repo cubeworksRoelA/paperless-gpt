@@ -54,14 +54,10 @@ services:
     environment:
       PAPERLESS_BASE_URL: http://paperless-ngx:8000
       PAPERLESS_API_TOKEN: ${PAPERLESS_API_TOKEN}
-      LLM_PROVIDER: ollama
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
       LLM_MODEL: ${LLM_MODEL:-qwen3.5:4b}
-      VISION_LLM_PROVIDER: ollama
+      VISION_LLM_PROVIDER: ${VISION_LLM_PROVIDER:-ollama}
       VISION_LLM_MODEL: ${VISION_LLM_MODEL:-openbmb/minicpm-v4.5}
-      OLLAMA_CONTEXT_LENGTH: "2048"
-      OLLAMA_HOST: http://100.80.55.45:11434
-      IMAGE_MAX_PIXEL_DIMENSION: "1024"
-      IMAGE_MAX_TOTAL_PIXELS: "1048576"
       LLM_LANGUAGE: ${LLM_LANGUAGE:-English}
       LOG_LEVEL: ${LOG_LEVEL:-info}
 

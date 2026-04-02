@@ -114,6 +114,7 @@ type Settings struct {
 	VisionLlmProvider       string `json:"vision_llm_provider,omitempty"`
 	VisionLlmModel          string `json:"vision_llm_model,omitempty"`
 	OllamaHost              string `json:"ollama_host,omitempty"`
+	OllamaContextLength     int    `json:"ollama_context_length,omitempty"`
 }
 
 // DocumentSuggestion is the response payload for /generate-suggestions endpoint and the request payload for /update-documents endpoint (as an array)
