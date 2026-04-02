@@ -305,7 +305,8 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			// Store image data for potential PDF generation
 			imageDataList = append(imageDataList, imageContent)
 
-			// Retry loop for OCR processing
+			// Retry loop for OCR processing with per-page timeout
+			const pageTimeout = 3 * time.Minute
 			var result *ocr.OCRResult
 			var ocrErr error
 			for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -323,11 +324,18 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 					time.Sleep(3 * time.Second)
 				}
 
-				result, ocrErr = app.ocrProvider.ProcessImage(ctx, imageContent, i+1)
+				pageCtx, pageCancel := context.WithTimeout(ctx, pageTimeout)
+				result, ocrErr = app.ocrProvider.ProcessImage(pageCtx, imageContent, i+1)
+				pageCancel()
 				if ocrErr == nil && result != nil {
 					break
 				}
-				pageLogger.WithError(ocrErr).Warnf("OCR attempt %d/%d failed for page %d", attempt, maxRetries, i+1)
+				if pageCtx.Err() == context.DeadlineExceeded {
+					pageLogger.Warnf("OCR attempt %d/%d timed out after %v for page %d", attempt, maxRetries, pageTimeout, i+1)
+					ocrErr = fmt.Errorf("timed out after %v", pageTimeout)
+				} else {
+					pageLogger.WithError(ocrErr).Warnf("OCR attempt %d/%d failed for page %d", attempt, maxRetries, i+1)
+				}
 			}
 
 			if ocrErr != nil || result == nil {
