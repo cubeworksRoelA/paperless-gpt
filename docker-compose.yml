@@ -1,9 +1,74 @@
 services:
-  app:
+  # --- Paperless-ngx and its dependencies ---
+  broker:
+    image: docker.io/redis:7
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+  db:
+    image: docker.io/postgres:17
+    restart: unless-stopped
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: paperless
+      POSTGRES_USER: paperless
+      POSTGRES_PASSWORD: paperless
+
+  paperless-ngx:
+    image: ghcr.io/paperless-ngx/paperless-ngx:latest
+    restart: unless-stopped
+    depends_on:
+      - db
+      - broker
+    ports:
+      - "8010:8000"
+    volumes:
+      - paperless-data:/usr/src/paperless/data
+      - paperless-media:/usr/src/paperless/media
+      - paperless-export:/usr/src/paperless/export
+      - paperless-consume:/usr/src/paperless/consume
+    environment:
+      PAPERLESS_REDIS: redis://broker:6379
+      PAPERLESS_DBHOST: db
+      PAPERLESS_DBNAME: paperless
+      PAPERLESS_DBUSER: paperless
+      PAPERLESS_DBPASS: paperless
+      PAPERLESS_URL: http://localhost:8000
+      PAPERLESS_ADMIN_USER: admin
+      PAPERLESS_ADMIN_PASSWORD: admin
+      USERMAP_UID: 1000
+      USERMAP_GID: 1000
+
+  # --- Paperless-GPT ---
+  paperless-gpt:
     build:
       context: .
       dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - paperless-ngx
     ports:
       - "8080:8080"
-    env_file:
-      - .env
+    environment:
+      PAPERLESS_BASE_URL: http://paperless-ngx:8000
+      PAPERLESS_API_TOKEN: ${PAPERLESS_API_TOKEN}
+      LLM_PROVIDER: ollama
+      LLM_MODEL: ${LLM_MODEL:-qwen3.5:4b}
+      VISION_LLM_PROVIDER: ollama
+      VISION_LLM_MODEL: ${VISION_LLM_MODEL:-openbmb/minicpm-v4.5}
+      OLLAMA_CONTEXT_LENGTH: "2048"
+      OLLAMA_HOST: http://100.80.55.45:11434
+      IMAGE_MAX_PIXEL_DIMENSION: "1024"
+      IMAGE_MAX_TOTAL_PIXELS: "1048576"
+      LLM_LANGUAGE: ${LLM_LANGUAGE:-English}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+volumes:
+  redis-data:
+  pgdata:
+  paperless-data:
+  paperless-media:
+  paperless-export:
+  paperless-consume:

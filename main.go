@@ -123,6 +123,7 @@ type App struct {
 	Database           *gorm.DB
 	LLM                llms.Model
 	VisionLLM          llms.Model
+	llmMu              sync.RWMutex      // Protects LLM and VisionLLM
 	ocrProvider        ocr.Provider      // OCR provider interface
 	ocrProcessMode     string            // OCR processing mode: "image" (default), "pdf" or "whole_pdf"
 	docProcessor       DocumentProcessor // Optional: Can be used for mocking
@@ -156,6 +157,24 @@ func main() {
 		log.Warn("Custom fields are enabled, but no custom fields are selected in the settings.")
 	}
 
+	// Override LLM settings from saved settings (if set)
+	if settings.LlmProvider != "" {
+		llmProvider = settings.LlmProvider
+		log.Infof("Using saved LLM provider from settings: %s", llmProvider)
+	}
+	if settings.LlmModel != "" {
+		llmModel = settings.LlmModel
+		log.Infof("Using saved LLM model from settings: %s", llmModel)
+	}
+	if settings.VisionLlmProvider != "" {
+		visionLlmProvider = settings.VisionLlmProvider
+		log.Infof("Using saved Vision LLM provider from settings: %s", visionLlmProvider)
+	}
+	if settings.VisionLlmModel != "" {
+		visionLlmModel = settings.VisionLlmModel
+		log.Infof("Using saved Vision LLM model from settings: %s", visionLlmModel)
+	}
+
 	// Print version
 	printVersion()
 
@@ -181,6 +200,10 @@ func main() {
 
 	// Initialize Database
 	database := InitializeDB()
+
+	// Initialize job store with DB and load persisted jobs
+	jobStore.db = database
+	jobStore.loadJobsFromDB()
 
 	// Load Templates
 	if err := loadTemplates(); err != nil {
@@ -376,6 +399,11 @@ func main() {
 		api.POST("/prompts", updatePromptsHandler)
 		api.GET("/settings", app.getSettingsHandler)
 		api.POST("/settings", app.updateSettingsHandler)
+		api.GET("/search-documents", app.searchDocumentsHandler)
+		api.GET("/document-thumbnail/:id", app.documentThumbnailProxyHandler)
+		api.GET("/llm-config", app.getLlmConfigHandler)
+		api.POST("/llm-config", app.updateLlmConfigHandler)
+		api.GET("/ollama-models", app.getOllamaModelsHandler)
 
 		// OCR endpoints
 		api.POST("/documents/:id/ocr", app.submitOCRJobHandler)
@@ -385,6 +413,7 @@ func main() {
 		api.GET("/jobs/ocr/:job_id", app.getJobStatusHandler)
 		api.GET("/jobs/ocr", app.getAllJobsHandler)
 		api.POST("/ocr/jobs/:job_id/stop", app.stopOCRJobHandler)
+		api.POST("/ocr/jobs/:job_id/skip-page/:page", app.skipOCRPageHandler)
 
 		// Endpoint to see if user enabled OCR
 		api.GET("/experimental/ocr", func(c *gin.Context) {

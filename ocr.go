@@ -124,10 +124,10 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 		docLogger.Debug("OCR provider does not support hOCR")
 	}
 
-	// Use the page limit from options if provided, otherwise use the global setting
-	pageLimit := limitOcrPages
-	if options.LimitPages > 0 {
-		pageLimit = options.LimitPages
+	// Use the page limit from options; 0 means no limit (process all pages)
+	pageLimit := options.LimitPages
+	if pageLimit < 0 {
+		pageLimit = limitOcrPages
 	}
 
 	var ocrTexts []string
@@ -265,11 +265,11 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			"limit_pages":          pageLimit,
 		}).Debug("Downloaded document images")
 
+		const maxRetries = 2
 		for i, imagePath := range imagePaths {
 			select {
 			case <-ctx.Done():
 				docLogger.Info("Job cancelled before processing page")
-				// Return partial results if cancelled
 				return &ProcessedDocument{
 					ID:   documentID,
 					Text: strings.Join(ocrTexts, "\n\n"),
@@ -277,25 +277,71 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			default:
 			}
 
+			// Check if this page should be skipped
+			if jobID != "" && isPageSkipped(jobID, i) {
+				docLogger.WithField("page", i+1).Info("Page skipped by user")
+				ocrTexts = append(ocrTexts, fmt.Sprintf("[Page %d: skipped]", i+1))
+				SaveSingleOcrPageResult(app.Database, documentID, i, fmt.Sprintf("[Page %d: skipped by user]", i+1), false, "")
+				if jobID != "" {
+					jobStore.updatePagesDone(jobID, i+1)
+				}
+				continue
+			}
+
 			pageLogger := docLogger.WithField("page", i+1)
 			pageLogger.Debug("Processing page")
 
 			imageContent, err := os.ReadFile(imagePath)
 			if err != nil {
-				return nil, fmt.Errorf("error reading image file for document %d, page %d: %w", documentID, i+1, err)
+				pageLogger.WithError(err).Error("Failed to read image file, skipping page")
+				ocrTexts = append(ocrTexts, fmt.Sprintf("[Page %d: failed to read image]", i+1))
+				SaveSingleOcrPageResult(app.Database, documentID, i, fmt.Sprintf("[Error: failed to read image: %v]", err), false, "")
+				if jobID != "" {
+					jobStore.updatePagesDone(jobID, i+1)
+				}
+				continue
 			}
 
 			// Store image data for potential PDF generation
 			imageDataList = append(imageDataList, imageContent)
 
-			// Pass the page number (1-based index) to ProcessImage
-			result, err := app.ocrProvider.ProcessImage(ctx, imageContent, i+1)
-			if err != nil {
-				return nil, fmt.Errorf("error performing OCR for document %d, page %d: %w", documentID, i+1, err)
+			// Retry loop for OCR processing
+			var result *ocr.OCRResult
+			var ocrErr error
+			for attempt := 1; attempt <= maxRetries; attempt++ {
+				select {
+				case <-ctx.Done():
+					return &ProcessedDocument{
+						ID:   documentID,
+						Text: strings.Join(ocrTexts, "\n\n"),
+					}, ctx.Err()
+				default:
+				}
+
+				if attempt > 1 {
+					pageLogger.Infof("Retrying OCR (attempt %d/%d), waiting 3s for model recovery...", attempt, maxRetries)
+					time.Sleep(3 * time.Second)
+				}
+
+				result, ocrErr = app.ocrProvider.ProcessImage(ctx, imageContent, i+1)
+				if ocrErr == nil && result != nil {
+					break
+				}
+				pageLogger.WithError(ocrErr).Warnf("OCR attempt %d/%d failed for page %d", attempt, maxRetries, i+1)
 			}
-			if result == nil {
-				pageLogger.Error("Got nil result from OCR provider")
-				return nil, fmt.Errorf("error performing OCR for document %d, page %d: nil result", documentID, i+1)
+
+			if ocrErr != nil || result == nil {
+				errMsg := "nil result"
+				if ocrErr != nil {
+					errMsg = ocrErr.Error()
+				}
+				pageLogger.WithError(ocrErr).Errorf("OCR failed for page %d after %d attempts, skipping", i+1, maxRetries)
+				ocrTexts = append(ocrTexts, fmt.Sprintf("[Page %d: OCR failed - %s]", i+1, errMsg))
+				SaveSingleOcrPageResult(app.Database, documentID, i, fmt.Sprintf("[Error: OCR failed after %d attempts: %s]", maxRetries, errMsg), false, "")
+				if jobID != "" {
+					jobStore.updatePagesDone(jobID, i+1)
+				}
+				continue
 			}
 
 			if jobID != "" {
@@ -319,7 +365,6 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 			saveErr := SaveSingleOcrPageResult(app.Database, documentID, i, result.Text, result.OcrLimitHit, genInfoJSON)
 			if saveErr != nil {
 				pageLogger.WithError(saveErr).Error("Failed to save OCR page result to database")
-				// Continue processing other pages even if saving fails for one
 			}
 		}
 	}

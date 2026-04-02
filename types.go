@@ -109,6 +109,10 @@ type Settings struct {
 	CustomFieldsEnable      bool   `json:"custom_fields_enable"`
 	CustomFieldsSelectedIDs []int  `json:"custom_fields_selected_ids"`
 	CustomFieldsWriteMode   string `json:"custom_fields_write_mode"` // "append" or "replace"
+	LlmProvider             string `json:"llm_provider,omitempty"`
+	LlmModel                string `json:"llm_model,omitempty"`
+	VisionLlmProvider       string `json:"vision_llm_provider,omitempty"`
+	VisionLlmModel          string `json:"vision_llm_model,omitempty"`
 }
 
 // DocumentSuggestion is the response payload for /generate-suggestions endpoint and the request payload for /update-documents endpoint (as an array)

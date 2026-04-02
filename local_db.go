@@ -22,6 +22,18 @@ type ModificationHistory struct {
 	UndoneDate    string `gorm:"default:null"`           // Date and time of undoing the modification
 }
 
+// OCRJobRecord persists OCR job state to the database
+type OCRJobRecord struct {
+	ID         string `gorm:"primaryKey;size:36"`
+	DocumentID int    `gorm:"not null;index"`
+	Status     string `gorm:"size:20;not null"` // pending, in_progress, completed, failed, cancelled
+	Result     string `gorm:"type:TEXT"`
+	PagesDone  int
+	TotalPages int
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
 type OCRPageResult struct {
 	ID             uint   `gorm:"primaryKey"`
 	DocumentID     int    `gorm:"index;not null"`
@@ -50,7 +62,7 @@ func InitializeDB() *gorm.DB {
 	}
 
 	// Migrate the schema (create the tables if they don't exist)
-	err = db.AutoMigrate(&ModificationHistory{}, &OCRPageResult{})
+	err = db.AutoMigrate(&ModificationHistory{}, &OCRPageResult{}, &OCRJobRecord{})
 	if err != nil {
 		log.Fatalf("Failed to migrate database schema: %v", err)
 	}

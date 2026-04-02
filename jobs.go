@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"sort"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
+	"gorm.io/gorm"
 )
 
 var (
@@ -17,6 +19,10 @@ var (
 
 	reOcrCancellersMu sync.Mutex
 	reOcrCancellers   = make(map[string]context.CancelFunc)
+
+	// skipPages tracks pages to skip per job: jobID -> set of page indices (0-based)
+	skipPagesMu sync.Mutex
+	skipPages   = make(map[string]map[int]bool)
 )
 
 // Job represents an OCR job
@@ -36,6 +42,7 @@ type Job struct {
 type JobStore struct {
 	sync.RWMutex
 	jobs map[string]*Job
+	db   *gorm.DB
 }
 
 var (
@@ -48,8 +55,6 @@ var (
 )
 
 func init() {
-
-	// Initialize logger
 	logger.SetOutput(os.Stdout)
 	logger.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp: true,
@@ -62,11 +67,62 @@ func generateJobID() string {
 	return uuid.New().String()
 }
 
+// persistJob writes the job state to the database
+func (store *JobStore) persistJob(job *Job) {
+	if store.db == nil {
+		return
+	}
+	record := OCRJobRecord{
+		ID:         job.ID,
+		DocumentID: job.DocumentID,
+		Status:     job.Status,
+		Result:     job.Result,
+		PagesDone:  job.PagesDone,
+		TotalPages: job.TotalPages,
+		CreatedAt:  job.CreatedAt,
+		UpdatedAt:  job.UpdatedAt,
+	}
+	store.db.Save(&record)
+}
+
+// loadJobsFromDB loads all jobs from the database into memory
+func (store *JobStore) loadJobsFromDB() {
+	if store.db == nil {
+		return
+	}
+	var records []OCRJobRecord
+	store.db.Order("created_at DESC").Find(&records)
+
+	store.Lock()
+	defer store.Unlock()
+	for _, r := range records {
+		// Mark any in_progress/pending jobs as failed (server restarted)
+		status := r.Status
+		result := r.Result
+		if status == "in_progress" || status == "pending" {
+			status = "failed"
+			result = "Server restarted while job was running"
+		}
+		store.jobs[r.ID] = &Job{
+			ID:         r.ID,
+			DocumentID: r.DocumentID,
+			Status:     status,
+			Result:     result,
+			PagesDone:  r.PagesDone,
+			TotalPages: r.TotalPages,
+			CreatedAt:  r.CreatedAt,
+			UpdatedAt:  r.UpdatedAt,
+		}
+	}
+	logger.Infof("Loaded %d jobs from database", len(records))
+}
+
 func (store *JobStore) addJob(job *Job) {
 	store.Lock()
 	defer store.Unlock()
-	job.PagesDone = 0 // Initialize PagesDone to 0
+	job.PagesDone = 0
 	store.jobs[job.ID] = job
+	store.persistJob(job)
 	logger.Infof("Job added: %v", job)
 }
 
@@ -102,7 +158,8 @@ func (store *JobStore) updateJobStatus(jobID, status, result string) {
 			job.Result = result
 		}
 		job.UpdatedAt = time.Now()
-		logger.Infof("Job status updated: %v", job)
+		store.persistJob(job)
+		logger.Infof("Job status updated: %s -> %s", jobID, status)
 	}
 }
 
@@ -112,8 +169,29 @@ func (store *JobStore) updatePagesDone(jobID string, pagesDone int) {
 	if job, exists := store.jobs[jobID]; exists {
 		job.PagesDone = pagesDone
 		job.UpdatedAt = time.Now()
-		logger.Infof("Job pages done updated: %v", job)
+		store.persistJob(job)
 	}
+}
+
+func markPageSkipped(jobID string, pageIdx int) {
+	skipPagesMu.Lock()
+	defer skipPagesMu.Unlock()
+	if skipPages[jobID] == nil {
+		skipPages[jobID] = make(map[int]bool)
+	}
+	skipPages[jobID][pageIdx] = true
+}
+
+func isPageSkipped(jobID string, pageIdx int) bool {
+	skipPagesMu.Lock()
+	defer skipPagesMu.Unlock()
+	return skipPages[jobID] != nil && skipPages[jobID][pageIdx]
+}
+
+func cleanupSkipPages(jobID string) {
+	skipPagesMu.Lock()
+	defer skipPagesMu.Unlock()
+	delete(skipPages, jobID)
 }
 
 func startWorkerPool(app *App, numWorkers int) {
@@ -145,22 +223,22 @@ func processJob(app *App, job *Job) {
 	// Delete old OCR page results for this document before starting new OCR
 	if err := DeleteOcrPageResults(app.Database, job.DocumentID); err != nil {
 		logger.Errorf("Failed to delete old OCR page results for document %d: %v", job.DocumentID, err)
-		// Continue processing even if deletion fails
 	}
 
-	// Create OCR options from job options or app defaults
+	// Create OCR options: use job options, fill in app defaults for upload settings
 	options := job.Options
-	if (options == OCROptions{}) {
-		// Use app defaults if job options are not set
-		options = OCROptions{
-			UploadPDF:       app.pdfUpload,
-			ReplaceOriginal: app.pdfReplace,
-			CopyMetadata:    app.pdfCopyMetadata,
-			LimitPages:      limitOcrPages,
-		}
+	if !options.UploadPDF && app.pdfUpload {
+		options.UploadPDF = app.pdfUpload
+		options.ReplaceOriginal = app.pdfReplace
+		options.CopyMetadata = app.pdfCopyMetadata
+	}
+	// LimitPages=0 means no limit (process all pages); only use global default for background jobs
+	if options.LimitPages < 0 {
+		options.LimitPages = limitOcrPages
 	}
 
 	processedDoc, err := app.ProcessDocumentOCR(jobCtx, job.DocumentID, options, job.ID)
+	defer cleanupSkipPages(job.ID)
 	if err != nil {
 		if jobCtx.Err() == context.Canceled {
 			jobStore.updateJobStatus(job.ID, "cancelled", "Job cancelled by user")
@@ -177,6 +255,26 @@ func processJob(app *App, job *Job) {
 		return
 	}
 
-	jobStore.updateJobStatus(job.ID, "completed", processedDoc.Text)
+	// Build structured result with per-page results from DB
+	type pageResult struct {
+		Text        string                 `json:"text"`
+		OcrLimitHit bool                   `json:"ocrLimitHit"`
+		GenInfo     map[string]interface{} `json:"generationInfo,omitempty"`
+	}
+	dbResults, _ := GetOcrPageResults(app.Database, job.DocumentID)
+	perPage := make([]pageResult, 0, len(dbResults))
+	for _, r := range dbResults {
+		pr := pageResult{Text: r.Text, OcrLimitHit: r.OcrLimitHit}
+		if r.GenerationInfo != "" {
+			_ = json.Unmarshal([]byte(r.GenerationInfo), &pr.GenInfo)
+		}
+		perPage = append(perPage, pr)
+	}
+	structured, _ := json.Marshal(map[string]interface{}{
+		"combinedText":   processedDoc.Text,
+		"perPageResults": perPage,
+	})
+
+	jobStore.updateJobStatus(job.ID, "completed", string(structured))
 	logger.Infof("Job completed: %s", job.ID)
 }

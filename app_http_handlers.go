@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -226,14 +227,17 @@ func (app *App) submitOCRJobHandler(c *gin.Context) {
 		return
 	}
 
-	// Create a new job
-	jobID := generateJobID() // Implement a function to generate unique job IDs
+	// Create a new job with no page limit for UI-submitted jobs
+	jobID := generateJobID()
 	job := &Job{
 		ID:         jobID,
 		DocumentID: documentID,
 		Status:     "pending",
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
+		Options: OCROptions{
+			LimitPages: 0, // 0 = no limit for UI-submitted jobs
+		},
 	}
 
 	// Add job to store and queue
@@ -277,11 +281,13 @@ func (app *App) getAllJobsHandler(c *gin.Context) {
 	jobList := make([]gin.H, 0, len(jobs))
 	for _, job := range jobs {
 		response := gin.H{
-			"job_id":     job.ID,
-			"status":     job.Status,
-			"created_at": job.CreatedAt,
-			"updated_at": job.UpdatedAt,
-			"pages_done": job.PagesDone,
+			"job_id":      job.ID,
+			"document_id": job.DocumentID,
+			"status":      job.Status,
+			"created_at":  job.CreatedAt,
+			"updated_at":  job.UpdatedAt,
+			"pages_done":  job.PagesDone,
+			"total_pages": job.TotalPages,
 		}
 
 		if job.Status == "completed" {
@@ -294,6 +300,20 @@ func (app *App) getAllJobsHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, jobList)
+}
+
+// POST /api/ocr/jobs/:job_id/skip-page/:page
+func (app *App) skipOCRPageHandler(c *gin.Context) {
+	jobID := c.Param("job_id")
+	pageStr := c.Param("page")
+	pageIdx, err := strconv.Atoi(pageStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid page index"})
+		return
+	}
+	markPageSkipped(jobID, pageIdx)
+	log.Infof("Page %d marked for skip in job %s", pageIdx, jobID)
+	c.Status(http.StatusNoContent)
 }
 
 // POST /api/ocr/jobs/:job_id/stop
@@ -648,6 +668,181 @@ func getVersionHandler(c *gin.Context) {
 		"commit":    commit,
 		"buildDate": buildDate,
 	})
+}
+
+// searchDocumentsHandler handles the GET /api/documents/search endpoint
+func (app *App) searchDocumentsHandler(c *gin.Context) {
+	ctx := c.Request.Context()
+	query := c.Query("q")
+	pageSize := 20
+	if ps, err := strconv.Atoi(c.DefaultQuery("page_size", "20")); err == nil && ps > 0 && ps <= 100 {
+		pageSize = ps
+	}
+	page := 1
+	if p, err := strconv.Atoi(c.DefaultQuery("page", "1")); err == nil && p > 0 {
+		page = p
+	}
+
+	var path string
+	if query != "" {
+		path = fmt.Sprintf("api/documents/?query=%s&page=%d&page_size=%d", url.QueryEscape(query), page, pageSize)
+	} else {
+		path = fmt.Sprintf("api/documents/?page=%d&page_size=%d&ordering=-added", page, pageSize)
+	}
+
+	resp, err := app.Client.(*PaperlessClient).Do(ctx, "GET", path, nil)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("Failed to query Paperless-ngx: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	var raw struct {
+		Count   int `json:"count"`
+		Results []struct {
+			ID               int    `json:"id"`
+			Title            string `json:"title"`
+			CreatedDate      string `json:"created_date"`
+			OriginalFileName string `json:"original_file_name"`
+			Added            string `json:"added"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse response"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"count":   raw.Count,
+		"results": raw.Results,
+	})
+}
+
+// documentThumbnailProxyHandler proxies thumbnail requests to Paperless-ngx
+func (app *App) documentThumbnailProxyHandler(c *gin.Context) {
+	ctx := c.Request.Context()
+	id := c.Param("id")
+	path := fmt.Sprintf("api/documents/%s/thumb/", id)
+
+	resp, err := app.Client.(*PaperlessClient).Do(ctx, "GET", path, nil)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to fetch thumbnail"})
+		return
+	}
+	defer resp.Body.Close()
+
+	c.DataFromReader(resp.StatusCode, resp.ContentLength, resp.Header.Get("Content-Type"), resp.Body, nil)
+}
+
+// getLlmConfigHandler handles the GET /api/llm-config endpoint
+func (app *App) getLlmConfigHandler(c *gin.Context) {
+	app.llmMu.RLock()
+	defer app.llmMu.RUnlock()
+	settingsMutex.RLock()
+	defer settingsMutex.RUnlock()
+
+	c.JSON(http.StatusOK, gin.H{
+		"llm_provider":       llmProvider,
+		"llm_model":          llmModel,
+		"vision_llm_provider": visionLlmProvider,
+		"vision_llm_model":    visionLlmModel,
+	})
+}
+
+// updateLlmConfigHandler handles the POST /api/llm-config endpoint
+func (app *App) updateLlmConfigHandler(c *gin.Context) {
+	var req struct {
+		LlmProvider       string `json:"llm_provider"`
+		LlmModel          string `json:"llm_model"`
+		VisionLlmProvider string `json:"vision_llm_provider"`
+		VisionLlmModel    string `json:"vision_llm_model"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload"})
+		return
+	}
+
+	// Update global vars
+	if req.LlmProvider != "" {
+		llmProvider = req.LlmProvider
+	}
+	if req.LlmModel != "" {
+		llmModel = req.LlmModel
+	}
+	if req.VisionLlmProvider != "" {
+		visionLlmProvider = req.VisionLlmProvider
+	}
+	if req.VisionLlmModel != "" {
+		visionLlmModel = req.VisionLlmModel
+	}
+
+	// Recreate LLM clients
+	newLLM, err := createLLM()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create LLM: %v", err)})
+		return
+	}
+	newVisionLLM, err := createVisionLLM()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create Vision LLM: %v", err)})
+		return
+	}
+
+	app.llmMu.Lock()
+	app.LLM = newLLM
+	app.VisionLLM = newVisionLLM
+	app.llmMu.Unlock()
+
+	// Persist to settings
+	settingsMutex.Lock()
+	settings.LlmProvider = llmProvider
+	settings.LlmModel = llmModel
+	settings.VisionLlmProvider = visionLlmProvider
+	settings.VisionLlmModel = visionLlmModel
+	if err := saveSettingsLocked(); err != nil {
+		log.Errorf("Failed to save LLM config to settings: %v", err)
+	}
+	settingsMutex.Unlock()
+
+	log.Infof("LLM config updated: provider=%s model=%s vision_provider=%s vision_model=%s",
+		llmProvider, llmModel, visionLlmProvider, visionLlmModel)
+
+	c.JSON(http.StatusOK, gin.H{"message": "LLM configuration updated successfully"})
+}
+
+// getOllamaModelsHandler handles the GET /api/ollama-models endpoint
+func (app *App) getOllamaModelsHandler(c *gin.Context) {
+	host := os.Getenv("OLLAMA_HOST")
+	if host == "" {
+		host = "http://127.0.0.1:11434"
+	}
+
+	resp, err := http.Get(host + "/api/tags")
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("Failed to connect to Ollama: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Models []struct {
+			Name   string `json:"name"`
+			Model  string `json:"model"`
+			Size   int64  `json:"size"`
+			Details struct {
+				ParameterSize    string   `json:"parameter_size"`
+				QuantizationLevel string  `json:"quantization_level"`
+				Family           string   `json:"family"`
+				Families         []string `json:"families"`
+			} `json:"details"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse Ollama response"})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
 }
 
 // containsDotDot checks if a string contains ".." to prevent path traversal.
